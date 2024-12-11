@@ -3,11 +3,13 @@ import os
 import re
 import subprocess
 from datetime import datetime
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 
 class CodeSummary:
     """Get some information about code and make a simple summary"""
+
     code_from: str
     code_branch: list
     code_tag: list
@@ -17,6 +19,10 @@ class CodeSummary:
     login_ip: str
     login_user: str
     login_pwd: str
+    board: str
+    subtarget: str
+    arch_packages: str
+    profile: list
 
     def __init__(self, codedir):
         self.codedir = codedir
@@ -27,58 +33,60 @@ class CodeSummary:
 
     @property
     def summary_dict(self):
-        last_log = self.get_last_log()
-        build_date = self.get_build_date()
-        login_info = self.get_login_info()
-        profiles = self.get_profiles()
         return {
-            'code_from': last_log[0],
-            'code_branch': last_log[1],
-            'code_tag': last_log[2],
-            'code_commit_hash': last_log[3],
-            'code_commit_date': last_log[4],
-            'build_date': build_date,
-            'login_ip': login_info[0],
-            'login_user': login_info[1],
-            'login_pwd': login_info[2],
-            'board': profiles[0],
-            'subtarget': profiles[1],
-            'profile': profiles[2],
-            'arch_packages': profiles[3]
+            **self.get_last_log(),
+            **self.get_build_date(),
+            **self.get_login_info(),
+            **self.get_profiles()
         }
-
 
     def get_profiles(self):
         """Get some configuration values from the .config file
         Example:
         CONFIG_TARGET_BOARD="ramips"
         CONFIG_TARGET_SUBTARGET="mt7621"
-        CONFIG_TARGET_PROFILE="DEVICE_xiaomi_mi-router-cr6608"
         CONFIG_TARGET_ARCH_PACKAGES="mipsel_24kc"
+        CONFIG_TARGET_ramips_mt7621_DEVICE_xiaomi_mi-router-ac2100=y
+        CONFIG_TARGET_DEVICE_ramips_mt7621_DEVICE_xiaomi_mi-router-ac2100=y
         """
 
         file = self.config
-        board = None
-        subtarget = None
-        profile = None
-        arch_packages = None
+        profiles = {
+            'board': '',
+            'subtarget': '',
+            'arch_packages': '',
+            'profile': []
+        }
+        patterns = {
+            'board': r'CONFIG_TARGET_BOARD="(.*)"',
+            'subtarget': r'CONFIG_TARGET_SUBTARGET="(.*)"',
+            'arch_packages': r'CONFIG_TARGET_ARCH_PACKAGES="(.*)"',
+            'profile': r'CONFIG_TARGET_(?!PER_).*DEVICE_(.*)=y'
+        }
         with open(file, encoding='utf-8') as f:
             for line in f:
-                if line.startswith('CONFIG_TARGET_BOARD='):
-                    board = line.split('=')[1].strip().strip('"')
-                elif line.startswith('CONFIG_TARGET_SUBTARGET='):
-                    subtarget = line.split('=')[1].strip().strip('"')
-                elif line.startswith('CONFIG_TARGET_PROFILE='):
-                    profile = line.split('=')[1].strip().strip('"').removeprefix('DEVICE_')
-                elif line.startswith('CONFIG_TARGET_ARCH_PACKAGES='):
-                    arch_packages = line.split('=')[1].strip().strip('"')
-
-                if all([board, subtarget, profile, arch_packages]):
+                for k, v in patterns.items():
+                    m = re.match(v, line)
+                    try:
+                        profiles[k].append(m.group(1))
+                    except AttributeError:
+                        profiles[k] = m.group(1)
+                    finally:
+                        continue
+                if re.match('CONFIG_LINUX_', line):
                     break
-        return board, subtarget, profile, arch_packages
+        return profiles
 
     def get_last_log(self):
-        prev_dir = os.getcwd()
+        log = {
+            'code_from': '',
+            'code_branch': [],
+            'code_tag': [],
+            'code_commit_hash': '',
+            'code_commit_date': ''
+        }
+
+        prev_path = os.getcwd()
         os.chdir(self.codedir)
         code_url = subprocess.run(
             'git remote get-url origin',
@@ -87,40 +95,39 @@ class CodeSummary:
             text=True).stdout.strip()
 
         code_name_table = {
-            ('coolsnowwolf', 'lede'): 'lede'
+            'coolsnowwolf/lede': 'lede'
         }
-        code_ = tuple(code_url.rstrip('/').removesuffix('.git').split('/')[-2:])
+        code_ = urlparse(code_url).path[1:].removesuffix('.git')
         try:
-            code_from = code_name_table[code_]
+            log['code_from'] = code_name_table[code_]
         except KeyError:
-            if code_[0] == code_[1]:
-                code_from = code_[0]
+            m = code_.split('/')
+            if m[0] == m[1]:
+                log['code_from'] = m[0]
             else:
-                code_from = code_[0] + '/' + code_[1]
+                log['code_from'] = code_
 
         code_commit_log = subprocess.run(
             'git log -1 --pretty=format:%cI%n%h%n%D',
             shell=True,
             capture_output=True,
             text=True).stdout.strip().split('\n')
-        code_commit_date = datetime.fromisoformat(
+        log['code_commit_date'] = datetime.fromisoformat(
             code_commit_log[0]).astimezone(ZoneInfo('Asia/Shanghai')).isoformat()
-        code_commit_hash = code_commit_log[1][:7]
+        log['code_commit_hash'] = code_commit_log[1][:7]
         code_ref = code_commit_log[2].replace(' ', '').split(',')
 
-        code_branch = []
-        code_tag = []
         for r in code_ref:
             if r.startswith('HEAD->'):
-                code_branch.append(r[6:])
+                log['code_branch'].append(r[6:])
             elif r.startswith('tag:'):
-                code_tag.append(r[4:])
-            elif '/' in r or r == 'HEAD':
+                log['code_tag'].append(r[4:])
+            elif '/' in r or r == 'HEAD' or r == 'grafted':
                 pass
             else:
-                code_branch.append(r)
+                log['code_branch'].append(r)
 
-        if not code_branch:
+        if not log['code_branch']:
             tag_belong_to = subprocess.run(
                 'git branch --contains HEAD',
                 shell=True,
@@ -128,35 +135,29 @@ class CodeSummary:
                 text=True).stdout.strip().split('\n')
             for tb in tag_belong_to:
                 if not tb.startswith('* (HEAD detached'):
-                    code_branch.append(tb.strip())
-        if not code_tag:
-            code_tag.append('snapshot')
+                    log['code_branch'].append(tb.strip())
+        if not log['code_tag']:
+            log['code_tag'].append('snapshot')
 
-        for i, cb in enumerate(code_branch.copy()):
-            code_branch[i] = cb.removeprefix('openwrt-')
-        for i, ct in enumerate(code_tag.copy()):
-            code_tag[i] = ct.removeprefix('v')
+        for i, cb in enumerate(log['code_branch'].copy()):
+            log['code_branch'][i] = cb.removeprefix('openwrt-')
+        for i, ct in enumerate(log['code_tag'].copy()):
+            log['code_tag'][i] = ct.removeprefix('v')
 
-        os.chdir(prev_dir)
+        os.chdir(prev_path)
 
-        return (
-            code_from,
-            code_branch,
-            code_tag,
-            code_commit_hash,
-            code_commit_date
-        )
+        return log
 
     def get_build_date(self):
-        return datetime.now(ZoneInfo('Asia/Shanghai')).replace(microsecond=0).isoformat()
+        return {'build_date': datetime.now(ZoneInfo('Asia/Shanghai')).replace(microsecond=0).isoformat()}
 
     def get_login_info(self):
         username, password_id = self.__login_user()
-        return (
-            self.__login_ip(),
-            username,
-            self.__login_pwd(password_id)
-        )
+        return {
+            'login_user': username,
+            'login_ip': self.__login_ip(),
+            'login_pwd': self.__login_pwd(password_id)
+        }
 
     def __login_ip(self):
         """Read the ip address from the config_generate file
@@ -170,11 +171,8 @@ class CodeSummary:
                     ip_regex = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
                     match = re.search(ip_regex, line)
                     if match:
-                        ip = match.group()
-                    else:
-                        ip = ''
-                    break
-        return ip
+                        return match.group()
+                    return ''
 
     def __login_user(self):
         """Locate the 'config login' line from rpcd.config
@@ -183,6 +181,8 @@ class CodeSummary:
         Get the password id from the example string 'option password '$p$root'
         """
 
+        username = 'not set'
+        password_id = 'not set'
         file = self.rpcd
         with open(file, encoding='utf-8') as f:
             for line in f:
@@ -194,10 +194,7 @@ class CodeSummary:
                 elif 'option password' in line:
                     password_id = line.split()[-1].strip("'")[3:]
                     break
-        try:
-            return username, password_id
-        except UnboundLocalError:
-            return 'not set', 'not set'
+        return username, password_id
 
     def __login_pwd(self, password_id):
         """Read the line starting with the example string 'root' from the 'shadow' file
@@ -209,12 +206,7 @@ class CodeSummary:
             for line in f:
                 if line.startswith(password_id):
                     pwd_value = line.strip().split(':', 1)[-1]
-                    break
-        try:
-            if pwd_value == '::0:99999:7:::':
-                password = 'blank'
-            else:
-                password = 'customized by you'
-        except UnboundLocalError:
-            password = 'not set'
-        return password
+                    if pwd_value == '::0:99999:7:::':
+                        return 'blank'
+                    return 'customized by you'
+        return 'not set'
